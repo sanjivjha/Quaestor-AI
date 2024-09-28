@@ -21,6 +21,7 @@ from langchain.agents import Tool, AgentExecutor, create_react_agent
 from langchain_core.prompts import PromptTemplate
 from langchain.schema import Document
 import boto3
+import re
 
 from query_classifier import RuleBasedQueryClassifier, BaseClassifier, QueryClassification
 from answer_evaluator import AnswerEvaluator, AnswerEvaluation, BaseEvaluator
@@ -35,31 +36,57 @@ class FederatedKnowledgeBase:
         self.external_sources = {}
 
     def add_external_source(self, name: str, source: Callable):
-        """
-        Extension Point 1: Add External Knowledge Sources
-        Developers can add custom external knowledge sources here.
-        
-        Example:
-        def query_enterprise_db(query: str) -> List[Dict]:
-            # Implementation to query enterprise database
-            pass
-        
-        knowledge_base.add_external_source("enterprise_db", query_enterprise_db)
-        """
         self.external_sources[name] = source
 
-    def query(self, query: str, sources: List[str] = ["local"]) -> List[Dict]:
+    def query(self, query: str, sources: List[str] = ["local"]) -> List[Dict[str, str]]:
         results = []
         if "local" in sources:
-            results.extend(self.local_store.similarity_search(query))
+            local_results = self.local_store.similarity_search(query)
+            results.extend([
+                {"source": "local", "content": self._extract_content(doc)}
+                for doc in local_results
+            ])
         for source in sources:
             if source in self.external_sources:
-                results.extend(self.external_sources[source](query))
+                external_results = self.external_sources[source](query)
+                results.extend([
+                    {"source": source, "content": self._extract_content(doc)}
+                    for doc in external_results
+                ])
         return results
+
+    def _extract_content(self, doc) -> str:
+        if isinstance(doc, Document):
+            return doc.page_content
+        elif isinstance(doc, dict):
+            return doc.get('content', doc.get('page_content', 'No content available'))
+        elif isinstance(doc, str):
+            return doc
+        else:
+            return str(doc)
 
     def add_texts(self, texts: List[str]):
         self.local_store.add_texts(texts)
 
+    def federated_query(self, query: str) -> str:
+        all_sources = ["local"] + list(self.external_sources.keys())
+        results = self.query(query, sources=all_sources)
+        
+        formatted_results = []
+        for i, result in enumerate(results, 1):
+            source = result['source']
+            content = result['content'][:200] + "..." if len(result['content']) > 200 else result['content']
+            formatted_results.append(f"{i}. Source: {source}\n   Content: {content}")
+
+        return "\n\n".join(formatted_results)
+
+    def get_tool(self) -> Tool:
+        return Tool(
+            name="Federated Knowledge Base",
+            func=self.federated_query,
+            description="Queries the federated knowledge base including local and external sources. Use this for comprehensive information retrieval."
+        )
+    
 class SelfRAGSystem:
     def __init__(self, llm_model: str = "anthropic.claude-3-sonnet-20240229-v1:0", debug_mode: bool = False):
         bedrock_client = boto3.client('bedrock-runtime')
@@ -73,7 +100,7 @@ class SelfRAGSystem:
         self.tools = []
         self.agent_executor = None
         self.query_classifier = RuleBasedQueryClassifier(self.llm)
-        self.answer_evaluator = AnswerEvaluator(self.llm, self.embeddings)
+        self.answer_evaluator = AnswerEvaluator(self.llm)  # Updated to pass only LLM
         self.query_enhancer = QueryEnhancer(self.llm)
         self.wikipedia_tool = WikipediaTool(self.embeddings)
         self.debug_mode = debug_mode
@@ -81,9 +108,10 @@ class SelfRAGSystem:
         self._add_default_tools()
 
     def _add_default_tools(self):
-        """
-        Add default tools using the framework's add_tool method.
-        """
+        # Add Federated Knowledge Base tool
+        federated_kb_tool = self.knowledge_base.get_tool()
+        self.add_tool(federated_kb_tool)
+
         # Add Wikipedia tool
         wikipedia_tool = self.wikipedia_tool.get_tool()
         self.add_tool(wikipedia_tool)
@@ -180,27 +208,16 @@ class SelfRAGSystem:
         self.query_classifier = classifier
 
     def setup_agent(self):
-        retriever = self.knowledge_base.local_store.as_retriever()
-        qa_chain = RetrievalQA.from_chain_type(self.llm, retriever=retriever)
-        
-        qa_tool = Tool(
-            name="Knowledge Base",
-            func=lambda q: qa_chain.run(q),
-            description="Useful for answering questions using the knowledge base."
-        )
-        
-        self.tools.append(qa_tool)
-        
         prompt = PromptTemplate.from_template(
-            """You are an AI assistant tasked with answering questions based on the provided knowledge base and additional tools.
-            Use the most appropriate knowledge base or tool for each query, considering the RAG strategy provided.
-            If the knowledge base doesn't provide a satisfactory answer, use other available tools or your general knowledge.
+            """You are an AI assistant tasked with answering questions based on the provided tools.
+            Use the most appropriate tool for each query, considering the RAG strategy provided.
+            If the tools don't provide a satisfactory answer, use your general knowledge.
 
             You have access to the following tools:
 
             {tools}
 
-            Use the following format:
+            Use the following format EXACTLY, including the newlines:
 
             Question: the input question you must answer
             Thought: you should always think about what to do
@@ -211,9 +228,14 @@ class SelfRAGSystem:
             Thought: I now know the final answer
             Final Answer: the final answer to the original input question
 
+            Remember to ALWAYS include the "Action:" line after a "Thought:" line, even if you're not using a tool.
+            If you're not using a tool, you can use "Action: None" followed by "Action Input: None".
+
+            Begin! Remember to always use the exact format specified above.
+
             Human: {input}
-            AI: Let's approach this step-by-step:
-            
+            AI: Certainly! I'll answer your question step by step using the specified format.
+
             Question: {input}
             Thought: I need to determine the best approach to answer this question.
             {agent_scratchpad}"""
@@ -221,9 +243,8 @@ class SelfRAGSystem:
         
         agent = create_react_agent(self.llm, self.tools, prompt)
         self.agent_executor = AgentExecutor.from_agent_and_tools(
-            agent=agent, tools=self.tools, verbose=True, handle_parsing_errors=True
-        )
-
+        agent=agent, tools=self.tools, verbose=True, handle_parsing_errors=True
+    )
     def query(self, question: str, max_iterations: int = 3) -> Tuple[str, List[Dict[str, Any]]]:
         if not self.agent_executor:
             raise ValueError("Agent not set up. Please run setup_agent() first.")
@@ -240,19 +261,7 @@ class SelfRAGSystem:
                 
                 context = self.knowledge_base.query(question)
                 
-                # Ensure context is in the correct format
-                formatted_context = []
-                for item in context:
-                    if isinstance(item, Document):
-                        formatted_context.append({"content": item.page_content})
-                    elif isinstance(item, dict) and 'page_content' in item:
-                        formatted_context.append({"content": item['page_content']})
-                    elif isinstance(item, str):
-                        formatted_context.append({"content": item})
-                    else:
-                        raise ValueError(f"Unexpected context format: {type(item)}")
-                
-                evaluation = self.answer_evaluator.evaluate(question, actual_response, formatted_context)
+                evaluation = self.answer_evaluator.evaluate(question, actual_response, context)
                 
                 iteration_info = {
                     "iteration": i + 1,
@@ -263,27 +272,66 @@ class SelfRAGSystem:
                 }
                 iterations.append(iteration_info)
                 
-                if self._is_answer_satisfactory(evaluation):
+                if self._is_answer_satisfactory(evaluation, question):
                     return actual_response, iterations
                 
                 if i < max_iterations - 1:
                     question = self.query_enhancer.enhance_query(original_question, classification.explanation, actual_response, evaluation)
                     iteration_info["enhanced_query"] = question
             except Exception as e:
-                print(f"Error in iteration {i+1}: {str(e)}")
-                iterations.append({
-                    "iteration": i + 1,
-                    "error": str(e)
-                })
+                error_message = str(e)
+                print(f"Error in iteration {i+1}: {error_message}")
+                
+                if "Invalid Format" in error_message:
+                    # If it's a formatting error, we can try to recover by reminding the agent about the correct format
+                    reminder = "Remember to always use the correct format: Thought: ... followed by Action: ... and Action Input: ..."
+                    question = f"{reminder} {question}"
+                    iterations.append({
+                        "iteration": i + 1,
+                        "error": error_message,
+                        "recovery_attempt": "Reminded agent about correct format"
+                    })
+                else:
+                    iterations.append({
+                        "iteration": i + 1,
+                        "error": error_message
+                    })
+                
                 if i == max_iterations - 1:
-                    return f"Error occurred during query processing: {str(e)}", iterations
+                    return f"Error occurred during query processing: {error_message}", iterations
 
         return "Unable to generate a satisfactory answer after multiple attempts.", iterations
 
-    def _is_answer_satisfactory(self, evaluation: AnswerEvaluation, threshold: float = 0.7, hallucination_threshold: float = 0.3) -> bool:
-        average_score = (evaluation.relevance_score + evaluation.completeness_score + 
-                         evaluation.accuracy_score + evaluation.coherence_score) / 4
-        return average_score >= threshold and evaluation.hallucination_score <= hallucination_threshold
+    def _is_answer_satisfactory(self, evaluation: AnswerEvaluation, question: str, 
+                            threshold: float = 0.7, hallucination_threshold: float = 0.3, 
+                            date_accuracy_threshold: float = 0.9) -> bool:
+        # For date queries or other simple factual queries, be more lenient
+        if re.search(r'\b(date|today|current day|time|now)\b', question.lower()):
+            return evaluation.accuracy_score >= date_accuracy_threshold
+
+        # Weighted average score
+        weights = {
+            'relevance': 0.3,
+            'completeness': 0.2,
+            'accuracy': 0.3,
+            'coherence': 0.2
+        }
+        
+        weighted_score = (
+            weights['relevance'] * evaluation.relevance_score +
+            weights['completeness'] * evaluation.completeness_score +
+            weights['accuracy'] * evaluation.accuracy_score +
+            weights['coherence'] * evaluation.coherence_score
+        )
+
+        # Check if any individual score is critically low
+        critical_threshold = 0.4
+        if any(getattr(evaluation, f"{aspect}_score") < critical_threshold 
+            for aspect in ['relevance', 'accuracy']):
+            return False
+
+        return (weighted_score >= threshold and 
+                evaluation.hallucination_score <= hallucination_threshold)
 
     def get_knowledge_base_summary(self) -> str:
         return f"The knowledge base currently contains {self.knowledge_base.local_store.index.ntotal} entries."

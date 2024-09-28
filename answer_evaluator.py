@@ -83,27 +83,11 @@ class AnswerEvaluator(BaseEvaluator):
     This evaluator uses a language model to assess various aspects of the answer quality
     and enhances the evaluation with a semantic similarity check between the query and answer.
     """
-    def __init__(self, llm, embeddings):
-        """
-        Initialize the AnswerEvaluator.
-
-        Args:
-            llm: The language model to be used for evaluation.
-            embeddings: The embedding model for semantic similarity checking.
-        """
+    def __init__(self, llm):
         self.llm = llm
-        self.embeddings = embeddings
         self.llm_chain = self._create_llm_chain()
 
     def _create_llm_chain(self):
-        """
-        Create the LLM chain for evaluation.
-
-        This method sets up the prompt and output parser for the LLM-based evaluation.
-
-        Returns:
-            LLMChain: A configured LLM chain for answer evaluation.
-        """
         prompt = PromptTemplate(
             input_variables=["query", "answer", "context"],
             template="""Evaluate the following answer with respect to the given query and context. Consider these aspects:
@@ -120,7 +104,6 @@ Context: {context}
 
 Provide scores for each aspect on a scale of 0 to 1, where 1 is the highest (note: for hallucination, 0 means no hallucination detected, and 1 means severe hallucination).
 Also provide a brief explanation for your evaluation, particularly noting any detected hallucinations or unsupported claims.
-
 {format_instructions}
 """
         )
@@ -132,40 +115,17 @@ Also provide a brief explanation for your evaluation, particularly noting any de
         )
 
     def evaluate(self, query: str, answer: str, context: List[Dict[str, Any]]) -> AnswerEvaluation:
-        """
-        Evaluate the answer based on the query and context.
-
-        This method combines LLM-based evaluation with semantic similarity checking
-        to provide a comprehensive assessment of the answer quality.
-
-        Args:
-            query (str): The original question asked.
-            answer (str): The answer to be evaluated.
-            context (List[Dict[str, Any]]): The context used to generate the answer.
-
-        Returns:
-            AnswerEvaluation: An object containing the evaluation scores and explanation.
-        """
-        # LLM-based evaluation
         context_text = "\n".join([doc['content'] for doc in context])
         llm_evaluation = self.llm_chain.predict(query=query, answer=answer, context=context_text)
         
-        # Semantic similarity check
-        query_embedding = self.embeddings.embed_query(query)
-        answer_embedding = self.embeddings.embed_query(answer)
-        similarity_score = cosine_similarity([query_embedding], [answer_embedding])[0][0]
-        
-        # Combine evaluations
-        combined_evaluation = AnswerEvaluation(
-            relevance_score=(llm_evaluation.relevance_score + similarity_score) / 2,
+        return AnswerEvaluation(
+            relevance_score=llm_evaluation.relevance_score,
             completeness_score=llm_evaluation.completeness_score,
             accuracy_score=llm_evaluation.accuracy_score,
             hallucination_score=llm_evaluation.hallucination_score,
             coherence_score=llm_evaluation.coherence_score,
-            explanation=f"LLM Evaluation: {llm_evaluation.explanation}\nSemantic Similarity Score: {similarity_score:.2f}"
+            explanation=llm_evaluation.explanation
         )
-        
-        return combined_evaluation
 
 # Placeholder for future fact-checking implementation
 class FactChecker:
